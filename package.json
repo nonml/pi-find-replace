@@ -1,6 +1,6 @@
 {
   "name": "pi-find-replace",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension for surgical code search, symbol navigation, and targeted replacements",
   "type": "module",
   "main": "dist/index.js",
@@ -24,6 +24,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@vscode/ripgrep": "^1.18.0",
     "typebox": "^1.3.4"
   },
   "devDependencies": {

@@ -3,12 +3,112 @@
  *
  * All search tools route through here so we get consistent,
  * token-efficient output formatted for an LLM to consume.
+ *
+ * Uses a 3-tier fallback chain:
+ * 1. Bundled ripgrep (@vscode/ripgrep) — auto-installed via npm
+ * 2. System ripgrep (`rg`) — installed via package manager
+ * 3. Pure JavaScript fallback — zero dependencies, slower
  */
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { existsSync } from "node:fs";
 
 const execFileAsync = promisify(execFile);
+
+// ---------------------------------------------------------------------------
+// Bundled ripgrep (@vscode/ripgrep)
+// ---------------------------------------------------------------------------
+
+let bundledRgPath: string | null = null;
+let bundledRgError: string | null = null;
+
+try {
+  // Dynamic import to avoid crashing if package is missing
+  const vscodeRg = await import("@vscode/ripgrep");
+  if (vscodeRg?.rgPath && existsSync(vscodeRg.rgPath)) {
+    bundledRgPath = vscodeRg.rgPath;
+  } else {
+    bundledRgError = "@vscode/ripgrep resolved but binary not found";
+  }
+} catch {
+  bundledRgError = "@vscode/ripgrep not installed";
+}
+
+/**
+ * Try to run the bundled ripgrep binary.
+ * Returns results or null if bundled binary is unavailable.
+ */
+async function tryBundledRg(
+  rgPath: string,
+  args: string[],
+  cwd: string | undefined,
+): Promise<RgResult[] | null> {
+  try {
+    const result = await execFileAsync(rgPath, args, {
+      cwd,
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 30000, // 30s timeout
+    });
+    if (result.stdout.trim() === "") return [];
+    return parseRgJson(result.stdout);
+  } catch (err: unknown) {
+    const error = err as { status?: number; code?: string };
+    if (error.status === 1) return []; // no matches
+    if (error.code === "ETIMEDOUT") return null; // timeout, try next tier
+    return null; // binary failed
+  }
+}
+
+// ---------------------------------------------------------------------------
+// System ripgrep
+// ---------------------------------------------------------------------------
+
+/**
+ * Try to run the system ripgrep (`rg`).
+ * Returns results or null if system rg is unavailable.
+ */
+async function trySystemRg(
+  args: string[],
+  cwd: string | undefined,
+): Promise<RgResult[] | null> {
+  try {
+    const result = await execFileAsync("rg", args, {
+      cwd,
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 30000, // 30s timeout
+    });
+    if (result.stdout.trim() === "") return [];
+    return parseRgJson(result.stdout);
+  } catch (err: unknown) {
+    const error = err as { status?: number; code?: string };
+    if (error.status === 1) return []; // no matches
+    if (error.status === 127) return null; // rg not found
+    if (error.code === "ETIMEDOUT") return null; // timeout
+    return null; // other error
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pure JavaScript fallback
+// ---------------------------------------------------------------------------
+
+let fallbackImport: typeof import("./fallback.js") | null = null;
+
+async function getFallbackModule(): Promise<typeof import("./fallback.js")> {
+  if (!fallbackImport) {
+    fallbackImport = await import("./fallback.js");
+  }
+  return fallbackImport;
+}
+
+/**
+ * Run the pure JavaScript fallback scanner.
+ */
+async function tryFallbackRg(opts: RgOptions): Promise<RgResult[]> {
+  const mod = await getFallbackModule();
+  return mod.searchFallback(opts);
+}
 
 export interface RgMatch {
   file: string;
@@ -82,46 +182,64 @@ export function buildRgArgs(opts: RgOptions): string[] {
   // The query is always the last positional arg
   args.push(opts.query);
 
+  // Always specify a search directory to prevent hanging on large trees
+  // When no directory is given, ripgrep walks the entire cwd recursively
+  // which can include node_modules and cause timeouts
+  const searchDir = opts.filePattern
+    ? "."
+    : opts.cwd
+      ? "."
+      : ".";
+  args.push(searchDir);
+
   return args;
 }
 
 /**
- * Run ripgrep and parse NDJSON output into structured results.
+ * Run ripgrep with a 3-tier fallback chain.
  *
- * Ripgrep exits with code 1 when no matches are found.
- * We catch that and return an empty array instead of throwing.
+ * 1. Bundled ripgrep (@vscode/ripgrep) — fastest, auto-installed
+ * 2. System ripgrep (`rg`) — fast, requires manual install
+ * 3. Pure JavaScript fallback — slower, zero dependencies
+ *
+ * Returns structured results regardless of which tier succeeds.
  */
 export async function runRg(opts: RgOptions): Promise<RgResult[]> {
   const args = buildRgArgs(opts);
+  const cwd = opts.cwd;
 
-  let stdout = "";
-  let stderr = "";
-
-  try {
-    const result = await execFileAsync("rg", args, {
-      cwd: opts.cwd,
-      maxBuffer: 10 * 1024 * 1024, // 10 MB
-    });
-    stdout = result.stdout;
-    stderr = result.stderr;
-  } catch (err: unknown) {
-    const error = err as { status?: number; stderr?: string };
-    // Exit code 1 = no matches (normal for rg)
-    if (error.status === 1) {
-      return [];
+  // Tier 1: Bundled ripgrep
+  if (bundledRgPath) {
+    const result = await tryBundledRg(bundledRgPath, args, cwd);
+    if (result !== null) {
+      return result;
     }
-    // Exit code 2 = error, code 127 = rg not found
-    const msg = error.stderr ?? String(err);
-    if (error.status === 127) {
-      throw new Error(
-        "ripgrep (rg) is not installed. Install it via your package manager: " +
-          "https://github.com/BurntSushi/ripgrep#installation",
-      );
-    }
-    throw new Error(`ripgrep failed (exit ${error.status}): ${msg}`);
   }
 
-  return parseRgJson(stdout);
+  // Tier 2: System ripgrep
+  const systemResult = await trySystemRg(args, cwd);
+  if (systemResult !== null) {
+    return systemResult;
+  }
+
+  // Tier 3: Pure JavaScript fallback
+  return tryFallbackRg(opts);
+}
+
+/**
+ * Get the current ripgrep backend status.
+ * Useful for debugging which tier is being used.
+ */
+export function getRgStatus(): {
+  bundled: string | null;
+  system: boolean;
+  fallback: boolean;
+} {
+  return {
+    bundled: bundledRgPath ?? bundledRgError,
+    system: false, // Unknown until tried
+    fallback: true, // Always available
+  };
 }
 
 /**
@@ -148,18 +266,29 @@ export function parseRgJson(ndjson: string): RgResult[] {
     if (obj.type === "match") {
       const data = obj.data as {
         path?: { text?: string };
-        lines?: { line_number?: number; text?: string }[];
+        lines?: { text?: string } | { line_number?: number; text?: string }[];
+        line_number?: number;
       };
       const file = data.path?.text ?? "unknown";
-      const matchLine = data.lines?.[0];
+      // ripgrep 15+: line_number at data level, lines is { text }
+      // older: lines is [{ line_number, text }]
+      let lineNumber: number | undefined;
+      let text: string | undefined;
 
-      if (matchLine?.line_number && matchLine?.text !== undefined) {
+      if (Array.isArray(data.lines)) {
+        // Old format: lines is array [{ line_number, text }]
+        const first = data.lines[0];
+        lineNumber = first?.line_number;
+        text = first?.text;
+      } else {
+        // New format: line_number at data level, lines is { text }
+        lineNumber = data.line_number;
+        text = data.lines?.text;
+      }
+
+      if (lineNumber && text !== undefined) {
         const entries = fileMap.get(file) ?? [];
-        entries.push({
-          line: matchLine.line_number,
-          text: matchLine.text,
-          kind: "match",
-        });
+        entries.push({ line: lineNumber, text, kind: "match" });
         fileMap.set(file, entries);
       }
     }
@@ -168,18 +297,25 @@ export function parseRgJson(ndjson: string): RgResult[] {
     if (obj.type === "context") {
       const data = obj.data as {
         path?: { text?: string };
-        lines?: { line_number?: number; text?: string }[];
+        lines?: { text?: string } | { line_number?: number; text?: string }[];
+        line_number?: number;
       };
       const file = data.path?.text ?? "unknown";
-      const ctxLine = data.lines?.[0];
+      let lineNumber: number | undefined;
+      let text: string | undefined;
 
-      if (ctxLine?.line_number && ctxLine?.text !== undefined) {
+      if (Array.isArray(data.lines)) {
+        const first = data.lines[0];
+        lineNumber = first?.line_number;
+        text = first?.text;
+      } else {
+        lineNumber = data.line_number;
+        text = data.lines?.text;
+      }
+
+      if (lineNumber && text !== undefined) {
         const entries = fileMap.get(file) ?? [];
-        entries.push({
-          line: ctxLine.line_number,
-          text: ctxLine.text,
-          kind: "context",
-        });
+        entries.push({ line: lineNumber, text, kind: "context" });
         fileMap.set(file, entries);
       }
     }

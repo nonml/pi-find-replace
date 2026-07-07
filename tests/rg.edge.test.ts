@@ -73,7 +73,8 @@ describe("rg.ts - Ripgrep CLI Edge Cases", () => {
 
     it("handles empty query", () => {
       const args = buildRgArgs({ query: "" });
-      expect(args[args.length - 1]).toBe("");
+      expect(args).toContain(""); // query is empty string
+      expect(args[args.length - 1]).toBe("."); // directory appended
     });
 
     it("handles exclude globs with ! prefix", () => {
@@ -93,7 +94,7 @@ describe("rg.ts - Ripgrep CLI Edge Cases", () => {
       const rawRipgrepOutput = [
         '{"type":"begin","data":{"path":{"text":"file.ts"}}}',
         "INVALID_JSON_HERE_!!!",
-        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":[{"line_number":10,"text":"const x = 1"}]}}',
+        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":{"text":"const x = 1"},"line_number":10}}',
       ].join("\n");
 
       const results = parseRgJson(rawRipgrepOutput);
@@ -123,9 +124,9 @@ describe("rg.ts - Ripgrep CLI Edge Cases", () => {
     it("handles multiple matches in same file", () => {
       const raw = [
         '{"type":"begin","data":{"path":{"text":"file.ts"}}}',
-        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":[{"line_number":1,"text":"const a = 1"}]}}',
-        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":[{"line_number":5,"text":"const b = 2"}]}}',
-        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":[{"line_number":10,"text":"const c = 3"}]}}',
+        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":{"text":"const a = 1"},"line_number":1}}',
+        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":{"text":"const b = 2"},"line_number":5}}',
+        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":{"text":"const c = 3"},"line_number":10}}',
         '{"type":"end","data":{"path":{"text":"file.ts"}}}',
       ].join("\n");
 
@@ -140,10 +141,10 @@ describe("rg.ts - Ripgrep CLI Edge Cases", () => {
     it("handles matches across multiple files", () => {
       const raw = [
         '{"type":"begin","data":{"path":{"text":"a.ts"}}}',
-        '{"type":"match","data":{"path":{"text":"a.ts"},"lines":[{"line_number":1,"text":"foo"}]}}',
+        '{"type":"match","data":{"path":{"text":"a.ts"},"lines":{"text":"foo"},"line_number":1}}',
         '{"type":"end","data":{"path":{"text":"a.ts"}}}',
         '{"type":"begin","data":{"path":{"text":"b.ts"}}}',
-        '{"type":"match","data":{"path":{"text":"b.ts"},"lines":[{"line_number":3,"text":"foo"}]}}',
+        '{"type":"match","data":{"path":{"text":"b.ts"},"lines":{"text":"foo"},"line_number":3}}',
         '{"type":"end","data":{"path":{"text":"b.ts"}}}',
       ].join("\n");
 
@@ -156,9 +157,9 @@ describe("rg.ts - Ripgrep CLI Edge Cases", () => {
     it("handles context lines", () => {
       const raw = [
         '{"type":"begin","data":{"path":{"text":"file.ts"}}}',
-        '{"type":"context","data":{"path":{"text":"file.ts"},"lines":[{"line_number":9,"text":"before"}]}}',
-        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":[{"line_number":10,"text":"const x = 1"}]}}',
-        '{"type":"context","data":{"path":{"text":"file.ts"},"lines":[{"line_number":11,"text":"after"}]}}',
+        '{"type":"context","data":{"path":{"text":"file.ts"},"lines":{"text":"before"},"line_number":9}}',
+        '{"type":"match","data":{"path":{"text":"file.ts"},"lines":{"text":"const x = 1"},"line_number":10}}',
+        '{"type":"context","data":{"path":{"text":"file.ts"},"lines":{"text":"after"},"line_number":11}}',
       ].join("\n");
 
       const results = parseRgJson(raw);
@@ -172,7 +173,7 @@ describe("rg.ts - Ripgrep CLI Edge Cases", () => {
       const lines: string[] = [];
       for (let i = 1; i <= 1000; i++) {
         lines.push(
-          `{"type":"match","data":{"path":{"text":"big.ts"},"lines":[{"line_number":${i},"text":"line ${i}"}]}}`,
+          `{"type":"match","data":{"path":{"text":"big.ts"},"lines":{"text":"line ${i}"},"line_number":${i}}}`,
         );
       }
       const raw = lines.join("\n");

@@ -7,7 +7,8 @@ describe("buildRgArgs", () => {
     expect(args).toContain("--json");
     expect(args).toContain("--smart-case");
     expect(args).toContain("--fixed-strings");
-    expect(args[args.length - 1]).toBe("hello");
+    expect(args).toContain("hello");
+    expect(args[args.length - 1]).toBe("."); // search directory appended
   });
 
   it("adds --case-sensitive when matchCase is true", () => {
@@ -64,7 +65,24 @@ describe("parseRgJson", () => {
     expect(parseRgJson("\n\n")).toEqual([]);
   });
 
-  it("parses a single match", () => {
+  it("parses a single match (ripgrep 15+ format)", () => {
+    const json = JSON.stringify({
+      type: "match",
+      data: {
+        path: { text: "src/test.ts" },
+        lines: { text: "  const hello = world;" },
+        line_number: 42,
+      },
+    });
+    const results = parseRgJson(json);
+    expect(results).toHaveLength(1);
+    expect(results[0].file).toBe("src/test.ts");
+    expect(results[0].matches).toHaveLength(1);
+    expect(results[0].matches[0].line).toBe(42);
+    expect(results[0].matches[0].kind).toBe("match");
+  });
+
+  it("parses a single match (old array format)", () => {
     const json = JSON.stringify({
       type: "match",
       data: {
@@ -85,14 +103,16 @@ describe("parseRgJson", () => {
       type: "match",
       data: {
         path: { text: "src/test.ts" },
-        lines: [{ line_number: 10, text: "hello" }],
+        lines: { text: "hello" },
+        line_number: 10,
       },
     });
     const match2 = JSON.stringify({
       type: "match",
       data: {
         path: { text: "src/test.ts" },
-        lines: [{ line_number: 20, text: "hello again" }],
+        lines: { text: "hello again" },
+        line_number: 20,
       },
     });
     const results = parseRgJson(`${match1}\n${match2}`);
@@ -107,14 +127,16 @@ describe("parseRgJson", () => {
       type: "match",
       data: {
         path: { text: "src/a.ts" },
-        lines: [{ line_number: 1, text: "hello" }],
+        lines: { text: "hello" },
+        line_number: 1,
       },
     });
     const match2 = JSON.stringify({
       type: "match",
       data: {
         path: { text: "src/b.ts" },
-        lines: [{ line_number: 5, text: "hello" }],
+        lines: { text: "hello" },
+        line_number: 5,
       },
     });
     const results = parseRgJson(`${match1}\n${match2}`);
@@ -126,14 +148,16 @@ describe("parseRgJson", () => {
       type: "context",
       data: {
         path: { text: "src/test.ts" },
-        lines: [{ line_number: 41, text: "// before" }],
+        lines: { text: "// before" },
+        line_number: 41,
       },
     });
     const match = JSON.stringify({
       type: "match",
       data: {
         path: { text: "src/test.ts" },
-        lines: [{ line_number: 42, text: "const hello = world;" }],
+        lines: { text: "const hello = world;" },
+        line_number: 42,
       },
     });
     const results = parseRgJson(`${ctx}\n${match}`);
@@ -147,7 +171,8 @@ describe("parseRgJson", () => {
       type: "match",
       data: {
         path: { text: "src/test.ts" },
-        lines: [{ line_number: 1, text: "hello" }],
+        lines: { text: "hello" },
+        line_number: 1,
       },
     });
     const results = parseRgJson(`${match}\nnot-json\nmore-garbage`);
@@ -159,14 +184,16 @@ describe("parseRgJson", () => {
       type: "match",
       data: {
         path: { text: "src/test.ts" },
-        lines: [{ line_number: 20, text: "second" }],
+        lines: { text: "second" },
+        line_number: 20,
       },
     });
     const match1 = JSON.stringify({
       type: "match",
       data: {
         path: { text: "src/test.ts" },
-        lines: [{ line_number: 10, text: "first" }],
+        lines: { text: "first" },
+        line_number: 10,
       },
     });
     const results = parseRgJson(`${match2}\n${match1}`);
@@ -179,7 +206,8 @@ describe("parseRgJson", () => {
       type: "match",
       data: {
         path: {},
-        lines: [{ line_number: 1, text: "hello" }],
+        lines: { text: "hello" },
+        line_number: 1,
       },
     });
     const results = parseRgJson(match);
