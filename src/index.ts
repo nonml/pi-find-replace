@@ -20,6 +20,8 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { globSync } from "node:fs";
+import * as path from "node:path";
 
 // Search tools
 import { runRg, formatResults } from "./rg.js";
@@ -226,6 +228,65 @@ const MOVE_SYMBOL_PARAMS = Type.Object({
 });
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** True if two paths refer to the same file (case-insensitive on Windows). */
+function samePath(a: string, b: string): boolean {
+  const ra = path.resolve(process.cwd(), a);
+  const rb = path.resolve(process.cwd(), b);
+  return process.platform === "win32"
+    ? ra.toLowerCase() === rb.toLowerCase()
+    : ra === rb;
+}
+
+/** Strip a leading `./` or `.\` from a search-result path for display. */
+function displayPath(p: string): string {
+  return p.replace(/^\.[\\/]/, "");
+}
+
+/**
+ * Expand `$1..$n`, `$&` and `$$` in a replacement template the way
+ * String.prototype.replace does.
+ */
+function expandReplacement(
+  template: string,
+  match: string,
+  groups: (string | undefined)[],
+): string {
+  return template.replace(/\$(\$|&|\d{1,2})/g, (token, t: string) => {
+    if (t === "$") return "$";
+    if (t === "&") return match;
+    const n = parseInt(t, 10);
+    if (n >= 1 && n <= groups.length) return groups[n - 1] ?? "";
+    return token;
+  });
+}
+
+/** Dirs a `**` glob never descends into unless the pattern names them. */
+const GLOB_PRUNE_DIRS = ["node_modules", ".git"];
+
+/** Expand glob entries in a file list; returns files plus unmatched globs. */
+function expandFileList(files: string[]): { files: string[]; unmatched: string[] } {
+  const out: string[] = [];
+  const unmatched: string[] = [];
+  for (const entry of files) {
+    if (/[*?[\]{}]/.test(entry)) {
+      const prune = GLOB_PRUNE_DIRS.filter((d) => !entry.includes(d));
+      const matches = globSync(entry, {
+        cwd: process.cwd(),
+        exclude: (p: string) => prune.includes(path.basename(p)),
+      });
+      if (matches.length === 0) unmatched.push(entry);
+      out.push(...matches);
+    } else {
+      out.push(entry);
+    }
+  }
+  return { files: out, unmatched };
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -260,17 +321,24 @@ export default function (pi: ExtensionAPI) {
         multiline?: boolean;
       };
 
-      const flags = ["g", multiline ? "m" : "", preserveCase ? "i" : ""].join(
+      const flags = ["g", multiline ? "s" : "", preserveCase ? "i" : ""].join(
         "",
       );
       const regex = new RegExp(regexQuery, flags);
+      // Number of capture groups, so callback args can be split correctly.
+      const groupCount = new RegExp(`${regexQuery}|`, flags).exec("")!.length - 1;
 
       const results: string[] = [];
       let totalReplacements = 0;
       const skipped: { file: string; reason: string }[] = [];
       const defaultReplace = replaceString;
 
-      for (const file of files) {
+      const expanded = expandFileList(files);
+      for (const g of expanded.unmatched) {
+        skipped.push({ file: g, reason: "No files match glob" });
+      }
+
+      for (const file of expanded.files) {
         try {
           const content = readFile(file);
           if (content === null) {
@@ -279,30 +347,23 @@ export default function (pi: ExtensionAPI) {
           }
           let replacementCount = 0;
 
-          const newContent = content.replace(regex, (match, ...groups) => {
+          const newContent = content.replace(regex, (match: string, ...args: unknown[]) => {
             replacementCount++;
+            const groups = args.slice(0, groupCount) as (string | undefined)[];
+            const replacement = expandReplacement(defaultReplace, match, groups);
             if (preserveCase) {
-              // Preserve case heuristic
-              const replacement = defaultReplace.replace(
-                /\$(\d+)/g,
-                (_, n) => groups[parseInt(n) - 1] ?? "",
-              );
+              // Preserve case heuristic (all-caps must be checked first)
+              if (match === match.toUpperCase() && match !== match.toLowerCase()) {
+                return replacement.toUpperCase();
+              }
               if (
                 match[0] === match[0].toUpperCase() &&
                 match[0] !== match[0].toLowerCase()
               ) {
                 return replacement.charAt(0).toUpperCase() + replacement.slice(1);
               }
-              if (match === match.toUpperCase()) {
-                return replacement.toUpperCase();
-              }
-              return replacement;
             }
-            // Standard replacement with capture groups
-            return defaultReplace.replace(
-              /\$(\d+)/g,
-              (_, n) => groups[parseInt(n) - 1] ?? "",
-            );
+            return replacement;
           });
 
           if (replacementCount > 0) {
@@ -320,19 +381,23 @@ export default function (pi: ExtensionAPI) {
       }
 
       const prefix = dryRun ? "**DRY RUN** " : "";
+      const skippedNote =
+        skipped.length > 0
+          ? `\n\nSkipped:\n${skipped.map((s) => `  ${s.file}: ${s.reason}`).join("\n")}`
+          : "";
       if (totalReplacements === 0) {
         return {
           content: [
             {
               type: "text",
-              text: `${prefix}No matches found for "${regexQuery}" in the specified files.`,
+              text: `${prefix}No matches found for "${regexQuery}" in the specified files.${results.length > 0 ? `\n\n${results.join("\n")}` : ""}${skippedNote}`,
             },
           ],
-          details: { replacements: 0, dryRun },
+          details: { replacements: 0, dryRun, skipped },
         };
       }
 
-      let output = `${prefix}Replaced "${regexQuery}" → "${replaceString}":\n\n${results.join("\n")}\n\n${totalReplacements} total replacement${totalReplacements !== 1 ? "s" : ""} across ${results.length} file${results.length !== 1 ? "s" : ""}.`;
+      let output = `${prefix}Replaced "${regexQuery}" → "${replaceString}":\n\n${results.join("\n")}\n\n${totalReplacements} total replacement${totalReplacements !== 1 ? "s" : ""} across ${results.length} file${results.length !== 1 ? "s" : ""}.${skippedNote}`;
 
       if (!dryRun) {
         output += `\n\n**System Notice:** The content of the above files has changed. Run find_symbol or file_outline to get fresh line numbers before making line-range edits.`;
@@ -402,7 +467,7 @@ export default function (pi: ExtensionAPI) {
         // Try to get boundaries
         const boundary = findSymbolBoundary(decl.file, decl.line);
 
-        parts.push(`📄 ${decl.file}:${decl.line}`);
+        parts.push(`📄 ${displayPath(decl.file)}:${decl.line}`);
         parts.push("");
 
         if (boundary) {
@@ -466,7 +531,7 @@ export default function (pi: ExtensionAPI) {
         cwd: process.cwd(),
       });
 
-      const decl = declarations.find((d) => d.file === file);
+      const decl = declarations.find((d) => samePath(d.file, file));
       if (!decl) {
         return {
           content: [
@@ -517,7 +582,10 @@ export default function (pi: ExtensionAPI) {
         ? new RegExp(find, "g")
         : new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
 
-      const newSymbolContent = symbolContent.replace(regex, replace);
+      // Literal mode: use a replacer function so `$` in `replace` is not expanded
+      const newSymbolContent = isRegex
+        ? symbolContent.replace(regex, replace)
+        : symbolContent.replace(regex, () => replace);
       const replacementCount =
         symbolContent !== newSymbolContent ? 1 : 0;
 
@@ -667,7 +735,7 @@ export default function (pi: ExtensionAPI) {
       for (const [kind, refs] of byKind) {
         parts.push(`${kindLabels[kind] ?? kind} (${refs.length}):`);
         for (const ref of refs) {
-          parts.push(`  ${ref.file}:${ref.line}  ${ref.text.trim()}`);
+          parts.push(`  ${displayPath(ref.file)}:${ref.line}  ${ref.text.trim()}`);
         }
         parts.push("");
       }
@@ -771,7 +839,14 @@ export default function (pi: ExtensionAPI) {
 
       const actualSteps = Math.min(steps, depth);
       for (let i = 0; i < actualSteps; i++) {
-        undoFile(file);
+        try {
+          undoFile(file);
+        } catch (err: unknown) {
+          return {
+            content: [{ type: "text", text: `Undo failed after ${i} step${i !== 1 ? "s" : ""}: ${err instanceof Error ? err.message : String(err)}` }],
+            details: { undone: i, error: "conflict" },
+          };
+        }
       }
 
       const restored = readFile(file) ?? "";
@@ -822,7 +897,14 @@ export default function (pi: ExtensionAPI) {
 
       const actualSteps = Math.min(steps, depth);
       for (let i = 0; i < actualSteps; i++) {
-        redoFile(file);
+        try {
+          redoFile(file);
+        } catch (err: unknown) {
+          return {
+            content: [{ type: "text", text: `Redo failed after ${i} step${i !== 1 ? "s" : ""}: ${err instanceof Error ? err.message : String(err)}` }],
+            details: { redone: i, error: "conflict" },
+          };
+        }
       }
 
       const remaining = getRedoDepth(file);
@@ -872,7 +954,7 @@ export default function (pi: ExtensionAPI) {
         cwd: process.cwd(),
       });
 
-      const decl = declarations.find((d) => d.file === from);
+      const decl = declarations.find((d) => samePath(d.file, from));
       if (!decl) {
         return {
           content: [
@@ -901,10 +983,20 @@ export default function (pi: ExtensionAPI) {
 
       // Extract symbol source
       const symbolSource = boundary.source;
+      const sameFile = samePath(from, to);
+      const removedCount = boundary.endLine - boundary.startLine + 1;
 
-      // Read target file
-      let targetContent = readFile(to) ?? "";
-      const targetLines = targetContent.split("\n");
+      // Source with the symbol removed
+      const sourceLines = (readFile(from) ?? "").split("\n");
+      const sourceRemaining = [
+        ...sourceLines.slice(0, boundary.startLine - 1),
+        ...sourceLines.slice(boundary.endLine),
+      ];
+
+      // Read target file (for same-file moves, the source minus the symbol)
+      const targetLines = sameFile
+        ? sourceRemaining
+        : (readFile(to) ?? "").split("\n");
 
       // Determine insert position
       let insertIdx = 0;
@@ -920,12 +1012,39 @@ export default function (pi: ExtensionAPI) {
           kind: "any",
           cwd: process.cwd(),
         });
-        const targetDecl = targetDecls.find((d) => d.file === to);
-        if (targetDecl) {
-          const targetBoundary = findSymbolBoundary(to, targetDecl.line);
-          if (targetBoundary) {
-            insertIdx = targetBoundary.endLine; // 1-indexed end, use as 0-indexed insert
+        const targetDecl = targetDecls.find((d) => samePath(d.file, to));
+        const targetBoundary = targetDecl
+          ? findSymbolBoundary(to, targetDecl.line)
+          : null;
+        if (!targetBoundary) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Anchor symbol "${targetSymbol}" not found in ${to}. Nothing was moved.`,
+              },
+            ],
+            details: { error: "anchor_not_found" },
+          };
+        }
+        insertIdx = targetBoundary.endLine; // 1-indexed end, use as 0-indexed insert
+        if (sameFile) {
+          if (
+            targetBoundary.startLine <= boundary.endLine &&
+            targetBoundary.endLine >= boundary.startLine
+          ) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Anchor "${targetSymbol}" overlaps "${symbol}"; cannot move a symbol after itself.`,
+                },
+              ],
+              details: { error: "anchor_overlaps" },
+            };
           }
+          // Re-locate anchor after removing the moved range
+          if (targetBoundary.startLine > boundary.endLine) insertIdx -= removedCount;
         }
       }
 
@@ -937,23 +1056,16 @@ export default function (pi: ExtensionAPI) {
         ...targetLines.slice(insertIdx),
       ];
 
-      const newContent = newLines.join("\n");
-      writeFile(to, newContent);
-
-      // If same file, also remove from original location
-      // (handled by the insert shifting — we need to remove the original)
-      let removalNote = "";
-      if (from === to) {
-        // For same-file moves, we inserted a copy. Need to remove original.
-        // This is tricky with line shifts. For now, note it.
-        removalNote = `\n\n**Note:** For same-file moves, manually remove the original at ${from}:${boundary.startLine}–${boundary.endLine} if needed.`;
+      writeFile(to, newLines.join("\n"));
+      if (!sameFile) {
+        writeFile(from, sourceRemaining.join("\n"));
       }
 
       return {
         content: [
           {
             type: "text",
-            text: `Moved "${symbol}" from ${from}:${boundary.startLine}–${boundary.endLine} to ${to} (position: ${position}).${removalNote}`,
+            text: `Moved "${symbol}" from ${from}:${boundary.startLine}–${boundary.endLine} to ${to} (position: ${position}).`,
           },
         ],
         details: { symbol, from, to, position },

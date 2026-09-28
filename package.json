@@ -1,6 +1,6 @@
 {
   "name": "pi-find-replace",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pi extension for surgical code search, symbol navigation, and targeted replacements",
   "type": "module",
   "main": "dist/index.js",

@@ -15,6 +15,12 @@ export interface OutlineEntry {
   indent: number; // nesting level
 }
 
+/** Control-flow keywords that method-like patterns can mistake for names. */
+const CONTROL_KEYWORDS = new Set([
+  "if", "else", "for", "while", "do", "switch", "case", "catch", "return",
+  "throw", "new", "typeof", "await", "yield", "elif", "except", "with",
+]);
+
 /**
  * Generate an outline of a file.
  */
@@ -43,7 +49,7 @@ export function generateOutline(filePath: string): OutlineEntry[] {
       }
     }
 
-    if (!name) continue;
+    if (!name || CONTROL_KEYWORDS.has(name)) continue;
 
     // Detect kind from keywords
     const kind = detectKind(line);

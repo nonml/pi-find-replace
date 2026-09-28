@@ -86,84 +86,100 @@ export function findSymbolBoundary(
 
 /**
  * Find boundary by matching braces { } ( ) [ ].
- * Starts from the opening brace on or after the start line.
+ * The block opener is the first `{` outside parentheses/brackets (so
+ * destructured params like `f({ a }) {` are skipped); strings and comments
+ * are ignored. A declaration that ends in `;` before any block opens
+ * (e.g. `export const MAX = 10;`) ends on that line.
  */
 function findBraceBoundary(lines: string[], startIdx: number): number | null {
-  // Find the opening brace
-  let openChar = "";
-  let idx = startIdx;
+  let quote: string | null = null; // ' " or `
+  let inBlockComment = false;
+  let parenDepth = 0; // ( and [ depth before the block opens
+  let firstOther: string | null = null; // first ( or [ seen, fallback opener
+  let braceDepth = 0;
+  let opened = false;
 
-  while (idx < lines.length) {
-    const line = lines[idx];
-    const brace = findOpeningBrace(line);
-    if (brace) {
-      openChar = brace;
-      break;
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i];
+    if (quote !== "`") quote = null; // only template literals span lines
+
+    for (let j = 0; j < line.length; j++) {
+      const ch = line[j];
+      if (inBlockComment) {
+        if (ch === "*" && line[j + 1] === "/") {
+          inBlockComment = false;
+          j++;
+        }
+        continue;
+      }
+      if (quote) {
+        if (ch === "\\") j++;
+        else if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "/" && line[j + 1] === "/") break;
+      if (ch === "/" && line[j + 1] === "*") {
+        inBlockComment = true;
+        j++;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        quote = ch;
+        continue;
+      }
+
+      if (!opened) {
+        if (ch === "(" || ch === "[") {
+          if (firstOther === null) firstOther = ch;
+          parenDepth++;
+        } else if (ch === ")" || ch === "]") {
+          parenDepth--;
+        } else if (ch === "{" && parenDepth <= 0) {
+          opened = true;
+          braceDepth = 1;
+        }
+        continue;
+      }
+
+      if (ch === "{") braceDepth++;
+      else if (ch === "}") {
+        braceDepth--;
+        if (braceDepth === 0) return i;
+      }
     }
-    idx++;
+
+    // Brace-less declaration: statement ended before any block opened.
+    if (!opened && parenDepth <= 0 && line.trim().endsWith(";")) {
+      return i;
+    }
   }
 
-  if (!openChar) return null; // no brace found
-
-  const closeChar = getCloseChar(openChar);
-  let depth = 1;
-
-  // Count remaining braces on the same line (after the first opening brace)
-  const openLine = lines[idx];
-  let foundFirst = false;
-  for (const ch of openLine) {
-    if (ch === openChar) {
-      if (foundFirst) depth++;
-      foundFirst = true;
-    }
-    if (ch === closeChar) {
-      depth--;
-      if (depth === 0) return idx; // single-line block
-    }
+  if (!opened && firstOther) {
+    return findBracketBoundary(lines, startIdx, firstOther);
   }
-
-  // Continue from next line
-  for (let i = idx + 1; i < lines.length; i++) {
-    for (const ch of lines[i]) {
-      if (ch === openChar) depth++;
-      if (ch === closeChar) depth--;
-      if (depth === 0) return i;
-    }
-  }
-
-  return null; // unmatched brace
+  return null; // no brace found / unmatched brace
 }
 
 /**
- * Find the first opening brace in a line, ignoring strings and comments.
+ * Fallback: match a ( or [ opener using the original line-based scan.
  */
-function findOpeningBrace(line: string): string | null {
-  const trimmed = line.trim();
-
-  // Skip pure comment lines
-  if (trimmed.startsWith("//") || trimmed.startsWith("#") || trimmed.startsWith("*")) {
-    return null;
-  }
-
-  // Simple heuristic: find first { that's not in a string
-  // Prefer { over ( and [ for boundary detection
-  let inSingleQuote = false;
-  let inDoubleQuote = false;
-  let inTemplate = false;
-  let firstBrace = null;
-
-  for (const ch of line) {
-    if (ch === "'" && !inDoubleQuote && !inTemplate) inSingleQuote = !inSingleQuote;
-    if (ch === '"' && !inSingleQuote && !inTemplate) inDoubleQuote = !inDoubleQuote;
-    if (ch === "`" && !inSingleQuote && !inDoubleQuote) inTemplate = !inTemplate;
-
-    if (!inSingleQuote && !inDoubleQuote && !inTemplate) {
-      if (ch === "{") return ch; // prefer { always
-      if (firstBrace === null && "([".includes(ch)) firstBrace = ch;
+function findBracketBoundary(
+  lines: string[],
+  startIdx: number,
+  openChar: string,
+): number | null {
+  const closeChar = getCloseChar(openChar);
+  let depth = 0;
+  for (let i = startIdx; i < lines.length; i++) {
+    for (const ch of lines[i]) {
+      if (ch === openChar) depth++;
+      if (ch === closeChar) {
+        depth--;
+        if (depth === 0) return i;
+      }
     }
   }
-
-  return firstBrace;
+  return null;
 }
 
 function getCloseChar(open: string): string {
@@ -223,6 +239,7 @@ function findEndKeywordBoundary(lines: string[], startIdx: number): number | nul
     "struct",
     "class",
     "func",
+    "fun",
     "if",
     "for",
     "while",
@@ -244,13 +261,16 @@ function findEndKeywordBoundary(lines: string[], startIdx: number): number | nul
 
   if (braceIdx >= lines.length) return startIdx;
 
-  // Count braces (these languages use braces too)
-  let depth = 1;
+  // Count braces (these languages use braces too). The opening brace on
+  // braceIdx is counted by the loop itself, so start from 0.
+  let depth = 0;
   for (let i = braceIdx; i < lines.length; i++) {
     for (const ch of lines[i]) {
       if (ch === "{") depth++;
-      if (ch === "}") depth--;
-      if (depth === 0) return i;
+      if (ch === "}") {
+        depth--;
+        if (depth === 0) return i;
+      }
     }
   }
 
@@ -258,8 +278,12 @@ function findEndKeywordBoundary(lines: string[], startIdx: number): number | nul
 }
 
 function getIndentLevel(line: string): number {
-  const match = line.match(/^( +)/);
-  return match ? match[1].length : 0;
+  const match = line.match(/^[ \t]+/);
+  if (!match) return 0;
+  // Tabs advance to the next multiple of 8 (Python's rule).
+  let width = 0;
+  for (const ch of match[0]) width = ch === "\t" ? width + 8 - (width % 8) : width + 1;
+  return width;
 }
 
 /**

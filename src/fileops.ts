@@ -6,6 +6,7 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 /**
  * An edit entry in the undo/redo stack.
@@ -23,16 +24,42 @@ export interface EditEntry {
 const undoStack = new Map<string, EditEntry[]>();
 const redoStack = new Map<string, EditEntry[]>();
 
+/** Maximum undo entries kept per file. */
+export const MAX_UNDO_DEPTH = 50;
+
+/** Normalise a path into a stack key so `./a` and `a` share history. */
+function key(filePath: string): string {
+  return resolve(filePath);
+}
+
+/** Record an edit on the undo stack (capped) and clear the redo stack. */
+function pushUndo(filePath: string, entry: EditEntry): void {
+  const k = key(filePath);
+  const stack = [...(undoStack.get(k) ?? []), entry];
+  if (stack.length > MAX_UNDO_DEPTH) stack.splice(0, stack.length - MAX_UNDO_DEPTH);
+  undoStack.set(k, stack);
+  redoStack.delete(k);
+}
+
 /**
  * Read a file's content.
  * Returns null if the file does not exist.
  */
 export function readFile(filePath: string): string | null {
+  let buf: Buffer;
   try {
-    return readFileSync(filePath, "utf-8");
+    buf = readFileSync(filePath);
   } catch {
     return null;
   }
+  if (buf.includes(0)) {
+    throw new Error(`Refusing to edit binary file (contains NUL bytes): ${filePath}`);
+  }
+  const text = buf.toString("utf-8");
+  if (!Buffer.from(text, "utf-8").equals(buf)) {
+    throw new Error(`Refusing to edit non-UTF-8 file (would corrupt bytes): ${filePath}`);
+  }
+  return text;
 }
 
 /**
@@ -47,9 +74,7 @@ export function writeFile(filePath: string, content: string): void {
     after: content,
     timestamp: Date.now(),
   };
-
-  undoStack.set(filePath, [...(undoStack.get(filePath) ?? []), entry]);
-  redoStack.delete(filePath); // clear redo stack on new edit
+  pushUndo(filePath, entry);
 }
 
 /**
@@ -66,7 +91,7 @@ export function replaceInFile(
   if (before === null) return -1;
 
   const regex = typeof pattern === "string"
-    ? new RegExp(isRegex ? escapeRegex(pattern) : pattern, "g")
+    ? new RegExp(isRegex ? pattern : escapeRegex(pattern), "g")
     : pattern;
 
   const after = before.replace(regex, replacement);
@@ -80,9 +105,7 @@ export function replaceInFile(
       after,
       timestamp: Date.now(),
     };
-
-    undoStack.set(filePath, [...(undoStack.get(filePath) ?? []), entry]);
-    redoStack.delete(filePath);
+  pushUndo(filePath, entry);
   }
 
   return count;
@@ -105,14 +128,21 @@ function countReplacements(before: string, regex: RegExp): number {
  * Returns the restored content, or null if nothing to undo.
  */
 export function undoFile(filePath: string): string | null {
-  const stack = undoStack.get(filePath);
+  const k = key(filePath);
+  const stack = undoStack.get(k);
   if (!stack || stack.length === 0) return null;
 
-  const entry = stack.pop()!;
+  const entry = stack[stack.length - 1];
+  if (readFile(filePath) !== entry.after) {
+    throw new Error(
+      `Cannot undo ${filePath}: file was modified outside this extension since the last tracked edit.`,
+    );
+  }
+  stack.pop();
   writeFileSync(filePath, entry.before, "utf-8");
 
-  undoStack.set(filePath, stack);
-  redoStack.set(filePath, [...(redoStack.get(filePath) ?? []), entry]);
+  undoStack.set(k, stack);
+  redoStack.set(k, [...(redoStack.get(k) ?? []), entry]);
 
   return entry.before;
 }
@@ -122,14 +152,21 @@ export function undoFile(filePath: string): string | null {
  * Returns the redone content, or null if nothing to redo.
  */
 export function redoFile(filePath: string): string | null {
-  const stack = redoStack.get(filePath);
+  const k = key(filePath);
+  const stack = redoStack.get(k);
   if (!stack || stack.length === 0) return null;
 
-  const entry = stack.pop()!;
+  const entry = stack[stack.length - 1];
+  if (readFile(filePath) !== entry.before) {
+    throw new Error(
+      `Cannot redo ${filePath}: file was modified outside this extension since the undo.`,
+    );
+  }
+  stack.pop();
   writeFileSync(filePath, entry.after, "utf-8");
 
-  redoStack.set(filePath, stack);
-  undoStack.set(filePath, [...(undoStack.get(filePath) ?? []), entry]);
+  redoStack.set(k, stack);
+  undoStack.set(k, [...(undoStack.get(k) ?? []), entry]);
 
   return entry.after;
 }
@@ -138,14 +175,14 @@ export function redoFile(filePath: string): string | null {
  * Get the number of available undo steps for a file.
  */
 export function getUndoDepth(filePath: string): number {
-  return undoStack.get(filePath)?.length ?? 0;
+  return undoStack.get(key(filePath))?.length ?? 0;
 }
 
 /**
  * Get the number of available redo steps for a file.
  */
 export function getRedoDepth(filePath: string): number {
-  return redoStack.get(filePath)?.length ?? 0;
+  return redoStack.get(key(filePath))?.length ?? 0;
 }
 
 /**
@@ -180,9 +217,7 @@ export function replaceLines(opts: ReplaceLinesOptions): string {
     after: result,
     timestamp: Date.now(),
   };
-
-  undoStack.set(opts.filePath, [...(undoStack.get(opts.filePath) ?? []), entry]);
-  redoStack.delete(opts.filePath);
+  pushUndo(opts.filePath, entry);
 
   return result;
 }
@@ -219,9 +254,7 @@ export function insertAtLine(opts: InsertAtLineOptions): string {
     after: result,
     timestamp: Date.now(),
   };
-
-  undoStack.set(opts.filePath, [...(undoStack.get(opts.filePath) ?? []), entry]);
-  redoStack.delete(opts.filePath);
+  pushUndo(opts.filePath, entry);
 
   return result;
 }
@@ -273,9 +306,7 @@ export function moveLines(opts: MoveLinesOptions): string {
     after: result,
     timestamp: Date.now(),
   };
-
-  undoStack.set(opts.filePath, [...(undoStack.get(opts.filePath) ?? []), entry]);
-  redoStack.delete(opts.filePath);
+  pushUndo(opts.filePath, entry);
 
   return result;
 }
