@@ -1,5 +1,14 @@
-import { describe, it, expect } from "vitest";
-import { getSymbolPatterns, classifyReference } from "../src/symbols.js";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
+import {
+  getSymbolPatterns,
+  classifyReference,
+  buildDeclarationQuery,
+  scopeGlobs,
+  findSymbolDeclarations,
+} from "../src/symbols.js";
 
 // Re-export classifyReference for testing (it's not exported, so we'll test via patterns)
 // For now, test the pattern generation and classification logic
@@ -114,5 +123,76 @@ describe("classifyReference", () => {
     const line = "func AuthenticateUser(req *http.Request) (*Token, error) {";
     const hasFunc = /\bfunc\b/.test(line);
     expect(hasFunc).toBe(true);
+  });
+});
+
+describe("buildDeclarationQuery", () => {
+  it("substitutes the name into the capture group, not the first \w+ (type slot)", () => {
+    const re = new RegExp(buildDeclarationQuery("count", "variable"));
+    // Java-style `Type name = ...`: declares `count`, not `Foo`
+    expect(re.test("  Foo count = 1;")).toBe(true);
+    const typeRe = new RegExp(buildDeclarationQuery("Foo", "variable"));
+    expect(typeRe.test("  Foo count;")).toBe(false);
+  });
+
+  it("combines all patterns for a kind into one alternation", () => {
+    const re = new RegExp(buildDeclarationQuery("run", "function"));
+    expect(re.test("def run(self):")).toBe(true);
+    expect(re.test("pub fn run() {")).toBe(true);
+    expect(re.test("export function run() {")).toBe(true);
+    expect(re.test("export function runner() {")).toBe(false);
+  });
+
+  it("escapes regex metacharacters in the name", () => {
+    const re = new RegExp(buildDeclarationQuery("$el", "variable"));
+    expect(re.test("const $el = 1")).toBe(true);
+    expect(re.test("const xel = 1")).toBe(false);
+  });
+});
+
+describe("scopeGlobs", () => {
+  it("normalises directory scopes (trailing slash, ./, backslashes)", () => {
+    expect(scopeGlobs("src/")).toEqual(["src/**", "src"]);
+    expect(scopeGlobs("./src")).toEqual(["src/**", "src"]);
+    expect(scopeGlobs("src\\lib\\")).toEqual(["src/lib/**", "src/lib"]);
+  });
+
+  it("passes globs through unchanged", () => {
+    expect(scopeGlobs("src/**/*.ts")).toEqual(["src/**/*.ts"]);
+  });
+
+  it("treats empty and '.' as no scope", () => {
+    expect(scopeGlobs(undefined)).toBeUndefined();
+    expect(scopeGlobs("")).toBeUndefined();
+    expect(scopeGlobs("./")).toBeUndefined();
+  });
+});
+
+describe("findSymbolDeclarations", () => {
+  let dir: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "pfr-symbols-"));
+    mkdirSync(join(dir, "src"));
+    mkdirSync(join(dir, "lib"));
+    writeFileSync(join(dir, "src", "a.ts"), "export function target() {}\n");
+    writeFileSync(join(dir, "lib", "b.ts"), "export function target() {}\n");
+    writeFileSync(join(dir, "lib", "c.ts"), "export async function asyncTarget() {}\n");
+  });
+
+  it("finds declarations whose pattern match starts after a word char", async () => {
+    // `(?:^|\s)` matches the space after `export`; rg --word-regexp rejected this
+    const results = await findSymbolDeclarations({ name: "asyncTarget", cwd: dir });
+    expect(results.map((r) => r.file)).toEqual([`.${sep}lib${sep}c.ts`]);
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("finds declarations with a trailing-slash scope like 'src/'", async () => {
+    const results = await findSymbolDeclarations({ name: "target", scope: "src/", cwd: dir });
+    expect(results.map((r) => r.file)).toEqual([`.${sep}src${sep}a.ts`]);
+  });
+
+  it("returns one result per line even when several patterns match it", async () => {
+    const results = await findSymbolDeclarations({ name: "target", cwd: dir });
+    expect(results).toHaveLength(2);
   });
 });

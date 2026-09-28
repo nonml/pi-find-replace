@@ -195,38 +195,29 @@ export interface SymbolResult {
  * Find symbol declarations matching the given name.
  */
 export async function findSymbolDeclarations(opts: FindSymbolOptions): Promise<SymbolResult[]> {
-  const patterns = getSymbolPatterns(opts.kind ?? "any");
   const results: SymbolResult[] = [];
-  const seen = new Set<string>();
 
-  for (const pattern of patterns) {
-    const exactPattern = pattern.replace(/\\w\+/, `(?:${escapeRegex(opts.name)})`);
+  const rgOpts: RgOptions = {
+    query: buildDeclarationQuery(opts.name, opts.kind ?? "any"),
+    isRegex: true,
+    matchCase: false,
+    matchWholeWord: false, // see buildDeclarationQuery
+    includeGlobs: scopeGlobs(opts.scope),
+    excludeGlobs: ["**/node_modules", "**/.git", "**/dist", "**/build"],
+    cwd: opts.cwd,
+  };
 
-    const rgOpts: RgOptions = {
-      query: exactPattern,
-      isRegex: true,
-      matchCase: false,
-      matchWholeWord: true,
-      includeGlobs: opts.scope ? [`${opts.scope}/**`] : undefined,
-      excludeGlobs: ["**/node_modules", "**/.git", "**/dist", "**/build"],
-      cwd: opts.cwd,
-    };
+  // One search for all patterns: each extra search is a full tree walk
+  const rgResults = await runRg(rgOpts);
 
-    const rgResults = await runRg(rgOpts);
-
-    for (const result of rgResults) {
-      for (const match of result.matches) {
-        const key = `${result.file}:${match.line}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          results.push({
-            file: result.file,
-            line: match.line,
-            text: match.text,
-            kind: opts.kind ?? "any",
-          });
-        }
-      }
+  for (const result of rgResults) {
+    for (const match of result.matches) {
+      results.push({
+        file: result.file,
+        line: match.line,
+        text: match.text,
+        kind: opts.kind ?? "any",
+      });
     }
   }
 
@@ -293,7 +284,7 @@ export async function findSymbolReferences(opts: FindReferencesOptions): Promise
     isRegex: false,
     matchCase: false,
     matchWholeWord: true,
-    includeGlobs: opts.scope ? [`${opts.scope}/**`] : undefined,
+    includeGlobs: scopeGlobs(opts.scope),
     excludeGlobs: [
       "**/node_modules", "**/.git", "**/dist", "**/build",
       ...(opts.excludeFiles ?? []),
@@ -325,6 +316,38 @@ export async function findSymbolReferences(opts: FindReferencesOptions): Promise
   });
 
   return results;
+}
+
+/**
+ * Combine every declaration pattern for `kind` into one alternation,
+ * with the name-capturing `(\w+)` group replaced by the exact name.
+ * (Replacing the first bare `\w+` instead would hit type slots such as
+ * `\w+\s+(\w+)` in method/variable patterns.)
+ */
+export function buildDeclarationQuery(name: string, kind: SymbolKind): string {
+  // The patterns' own prefixes (`\s+`, `::`, ...) bound the name's start;
+  // `\b` bounds its end so `run` doesn't match `runner`. Word-regexp mode
+  // can't be used instead: patterns begin with `(?:^|\s)`, so in
+  // `export async function f` the match starts right after a word char.
+  const exactName = /\w$/.test(name)
+    ? `(?:${escapeRegex(name)})\\b`
+    : `(?:${escapeRegex(name)})`;
+  return getSymbolPatterns(kind)
+    .map((pattern) => `(?:${pattern.replace("(\\w+)", exactName)})`)
+    .join("|");
+}
+
+/**
+ * Turn a user-supplied scope into include globs. Accepts a directory
+ * ("src", "src/", "./src"), a file, or a glob ("src/**\/*.ts").
+ */
+export function scopeGlobs(scope: string | undefined): string[] | undefined {
+  if (!scope) return undefined;
+  const s = scope.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+  if (s === "" || s === ".") return undefined;
+  if (/[*?[]/.test(s)) return [s];
+  // Directory contents, or the path itself when it is a file
+  return [`${s}/**`, s];
 }
 
 function escapeRegex(s: string): string {

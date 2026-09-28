@@ -31,10 +31,16 @@ For optimal performance, install [ripgrep](https://github.com/BurntSushi/ripgrep
 | Tier | Source | Speed | Setup |
 |------|--------|-------|-------|
 | 1 | Bundled (`@vscode/ripgrep`) | ⚡ Fastest | Auto-installed via npm |
-| 2 | System `rg` command | Fast | `brew install ripgrep` / `apt install ripgrep` / `choco install ripgrep` |
+| 2 | System `rg` command | Fast | Pi's own `rg` (`~/.pi/agent/bin`), or `brew install ripgrep` / `apt install ripgrep` / `choco install ripgrep` |
 | 3 | Pure JavaScript fallback | Slower | Always available, zero dependencies |
 
 The extension automatically detects which tier is available and uses the fastest option. If you have ripgrep installed (bundled or system), you'll get near-instant search results. Without it, the JavaScript fallback ensures everything still works.
+
+Tier 2 looks for `rg` by absolute path before trying `PATH`, so it also works in Pi sub-agent processes that don't inherit the main agent's `PATH`:
+
+1. `PI_FIND_REPLACE_RG` — set this to an `rg` binary to force a specific one
+2. `<agent dir>/bin/rg` — the binary Pi downloads, where the agent dir is `PI_CODING_AGENT_DIR` or `~/.pi/agent`
+3. `rg` on `PATH`
 
 ### Installation
 Install the extension globally using the Pi CLI package installer:
@@ -193,8 +199,21 @@ Moves a targeted code block (such as a function or class) from one file to anoth
 The extension uses a cascading search backend that automatically falls back if a tier is unavailable:
 
 1. **Bundled ripgrep** (`@vscode/ripgrep`) — Pre-compiled binaries shipped with the npm package. Uses ripgrep's JSON interface (`rg --json`) for structured, parse-free output.
-2. **System ripgrep** — Falls back to the globally installed `rg` command if the bundled binary is missing.
-3. **Pure JavaScript fallback** — A built-in file scanner using Node.js `fs` with regex matching. Slower than ripgrep but guarantees functionality on all platforms with zero native dependencies.
+2. **System ripgrep** — Falls back to Pi's managed `rg` or the globally installed `rg` command if the bundled binary is missing (e.g. in sub-agent processes that don't carry this package's `node_modules`).
+3. **Pure JavaScript fallback** — A built-in file scanner using Node.js `fs` with regex matching. Slower than ripgrep but guarantees functionality on all platforms with zero native dependencies. It is also used for regexes ripgrep's default engine rejects, such as look-ahead/look-behind.
+
+A later tier is tried only when the previous one can't run. "No matches" or a timeout is a final answer.
+
+The JavaScript fallback walks the same files ripgrep would:
+
+- **Skipped like ripgrep:** hidden files and directories (`.git`, `.dart_tool`, `.gradle`, `.venv`, ...), anything matched by `.gitignore` / `.ignore` files (nested, and from the enclosing repo when searching a subdirectory), binary files (containing a NUL byte), and symlinks.
+- **Also skipped, as a safety net when nothing ignores them:** `node_modules`, `bower_components`, `dist`, `build`, `Pods`, `Carthage`, `DerivedData`, `__pycache__`, `venv`.
+- **Hard limits** so a huge tree can't exhaust memory:
+  - files larger than 4 MB are skipped
+  - at most 10,000 files are searched
+  - at most 200,000 directory entries are visited
+  - about 10 MB of matched text is collected
+  - a search stops after 30 s
 
 All three tiers produce identical output formats, so the agent sees consistent results regardless of which backend is active.
 
